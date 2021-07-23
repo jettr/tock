@@ -230,3 +230,109 @@ impl<'a, A: Alarm<'a>> time::AlarmClient for MuxAlarm<'a, A> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::*;
+
+    struct FakeAlarm<'a> {
+        now: Cell<Ticks32>,
+        reference: Cell<Ticks32>,
+        dt: Cell<Ticks32>,
+        armed: Cell<bool>,
+        client: OptionalCell<&'a dyn AlarmClient>,
+    }
+
+    impl FakeAlarm<'_> {
+        fn new() -> Self {
+            Self {
+                now: Cell::new(1_000u32.into()),
+                reference: Cell::new(0u32.into()),
+                dt: Cell::new(0u32.into()),
+                armed: Cell::new(false),
+                client: OptionalCell::empty(),
+            }
+        }
+    }
+
+    impl Time for FakeAlarm<'_> {
+        type Ticks = Ticks32;
+        type Frequency = Freq1KHz;
+
+        fn now(&self) -> Ticks32 {
+            self.now.get()
+        }
+    }
+
+    impl<'a> Alarm<'a> for FakeAlarm<'a> {
+        fn set_alarm_client(&'a self, client: &'a dyn AlarmClient) {
+            self.client.set(client);
+        }
+
+        fn set_alarm(&self, reference: Self::Ticks, dt: Self::Ticks) {
+            self.reference.set(reference);
+            self.dt.set(dt);
+            self.armed.set(true);
+        }
+
+        fn get_alarm(&self) -> Self::Ticks {
+            self.reference.get().wrapping_add(self.dt.get())
+        }
+
+        fn disarm(&self) -> Result<(), ErrorCode> {
+            self.armed.set(false);
+            Ok(())
+        }
+
+        fn is_armed(&self) -> bool {
+            self.armed.get()
+        }
+
+        fn minimum_dt(&self) -> Self::Ticks {
+            0u32.into()
+        }
+    }
+
+    struct Client(Cell<usize>);
+    impl Client {
+        fn new() -> Self {
+            Self(Cell::new(0))
+        }
+        fn count(&self) -> usize {
+            self.0.get()
+        }
+    }
+    impl AlarmClient for Client {
+        fn alarm(&self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn test_max_ticks_dt() {
+        let alarm = FakeAlarm::new();
+        let client = Client::new();
+        let dt = u32::MAX.into();
+
+        let mux = MuxAlarm::new(&alarm);
+        alarm.set_alarm_client(&mux);
+
+        let valarm = VirtualMuxAlarm::new(&mux);
+
+        valarm.set_alarm_client(&client);
+        valarm.set_alarm(valarm.now(), dt);
+
+        assert_eq!(alarm.reference.get().into_u32(), alarm.now().into_u32());
+        assert_eq!(alarm.dt.get().into_u32(), dt.into_u32());
+
+        // Bump dt into future
+        alarm.now.set(alarm.now.get().wrapping_add(dt));
+
+        // Add one tick of jitter/delay from when hardware alarm fire to when client gets called
+        alarm.now.set(alarm.now.get().wrapping_add(1.into()));
+        alarm.client.map(|c| c.alarm());
+
+        assert_eq!(client.count(), 1);
+    }
+}
